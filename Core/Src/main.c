@@ -131,6 +131,7 @@ int main(void)
   printf("OTA board boot OK\r\n");
   printf("SYSCLK = %lu MHz\r\n", SystemCoreClock / 1000000UL);
   printf("FreeRTOS starting...\r\n");
+  printf("update!");
   HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin,GPIO_PIN_RESET);
   HAL_GPIO_WritePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin,GPIO_PIN_SET);
   /* USER CODE END 2 */

@@ -33,7 +33,79 @@
 
 /* Within 'USER CODE' section, code will be kept by default at each generation */
 /* USER CODE BEGIN 0 */
+/* ===== 软件 I2C，用于 PCF8574 释放网口 PHY 复位 ===== */
+#define SWI2C_SCL_PIN    GPIO_PIN_4
+#define SWI2C_SCL_PORT   GPIOH
+#define SWI2C_SDA_PIN    GPIO_PIN_5
+#define SWI2C_SDA_PORT   GPIOH
 
+static void SWI2C_SCL(uint8_t val) { HAL_GPIO_WritePin(SWI2C_SCL_PORT, SWI2C_SCL_PIN, val ? GPIO_PIN_SET : GPIO_PIN_RESET); }
+static void SWI2C_SDA(uint8_t val) { HAL_GPIO_WritePin(SWI2C_SDA_PORT, SWI2C_SDA_PIN, val ? GPIO_PIN_SET : GPIO_PIN_RESET); }
+
+static void SWI2C_Init(void)
+{
+  GPIO_InitTypeDef gpio = {0};
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  gpio.Pin = SWI2C_SCL_PIN | SWI2C_SDA_PIN;
+  gpio.Mode = GPIO_MODE_OUTPUT_OD;   /* 开漏，板上已有 4.7K 上拉 */
+  gpio.Pull = GPIO_PULLUP;
+  gpio.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOH, &gpio);
+  SWI2C_SCL(1);
+  SWI2C_SDA(1);
+  HAL_Delay(1);
+}
+
+static void SWI2C_Start(void)
+{
+  SWI2C_SDA(1); SWI2C_SCL(1); HAL_Delay(1);
+  SWI2C_SDA(0); HAL_Delay(1);
+  SWI2C_SCL(0);
+}
+
+static void SWI2C_Stop(void)
+{
+  SWI2C_SDA(0); HAL_Delay(1);
+  SWI2C_SCL(1); HAL_Delay(1);
+  SWI2C_SDA(1); HAL_Delay(1);
+}
+
+static void SWI2C_WriteByte(uint8_t data)
+{
+  int32_t i;
+  for (i = 7; i >= 0; i--)
+  {
+    SWI2C_SDA((data >> i) & 0x01u);
+    HAL_Delay(1);
+    SWI2C_SCL(1);
+    HAL_Delay(1);
+    SWI2C_SCL(0);
+  }
+  /* 第 9 个时钟读 ACK，这里不判断 */
+  SWI2C_SDA(1);
+  HAL_Delay(1);
+  SWI2C_SCL(1);
+  HAL_Delay(1);
+  SWI2C_SCL(0);
+}
+
+static void PCF8574_Write(uint8_t data)
+{
+  SWI2C_Start();
+  SWI2C_WriteByte(0x40u);   /* PCF8574 7位地址 0x20，写方向 = 0x40 */
+  SWI2C_WriteByte(data);
+  SWI2C_Stop();
+}
+
+/* 释放网口 PHY 复位：先拉低 P7，再拉高 P7 */
+static void ETH_PHY_Reset(void)
+{
+  SWI2C_Init();
+  PCF8574_Write(0x7Fu);   /* P7 = 0，复位 */
+  HAL_Delay(20);
+  PCF8574_Write(0xFFu);   /* P7 = 1，释放 */
+  HAL_Delay(20);
+}
 /* USER CODE END 0 */
 
 /* Private define ------------------------------------------------------------*/
@@ -186,8 +258,6 @@ static void low_level_init(struct netif *netif)
 /* USER CODE BEGIN OS_THREAD_ATTR_CMSIS_RTOS_V2 */
   osThreadAttr_t attributes;
 /* USER CODE END OS_THREAD_ATTR_CMSIS_RTOS_V2 */
-  uint32_t duplex, speed = 0;
-  int32_t PHYLinkState = 0;
   ETH_MACConfigTypeDef MACConf = {0};
   /* Start ETH HAL Init */
 
@@ -261,69 +331,19 @@ static void low_level_init(struct netif *netif)
 /* USER CODE END OS_THREAD_NEW_CMSIS_RTOS_V2 */
 
 /* USER CODE BEGIN PHY_PRE_CONFIG */
-
+  ETH_PHY_Reset();
 /* USER CODE END PHY_PRE_CONFIG */
-  /* Set PHY IO functions */
-  LAN8742_RegisterBusIO(&LAN8742, &LAN8742_IOCtx);
-
-  /* Initialize the LAN8742 ETH PHY */
-  if(LAN8742_Init(&LAN8742) != LAN8742_STATUS_OK)
-  {
-    netif_set_link_down(netif);
-    netif_set_down(netif);
-    return;
-  }
-
   if (hal_eth_init_status == HAL_OK)
   {
-    PHYLinkState = LAN8742_GetLinkState(&LAN8742);
-
-    /* Get link state */
-    if(PHYLinkState <= LAN8742_STATUS_LINK_DOWN)
-    {
-      netif_set_link_down(netif);
-      netif_set_down(netif);
-    }
-    else
-    {
-      switch (PHYLinkState)
-      {
-      case LAN8742_STATUS_100MBITS_FULLDUPLEX:
-        duplex = ETH_FULLDUPLEX_MODE;
-        speed = ETH_SPEED_100M;
-        break;
-      case LAN8742_STATUS_100MBITS_HALFDUPLEX:
-        duplex = ETH_HALFDUPLEX_MODE;
-        speed = ETH_SPEED_100M;
-        break;
-      case LAN8742_STATUS_10MBITS_FULLDUPLEX:
-        duplex = ETH_FULLDUPLEX_MODE;
-        speed = ETH_SPEED_10M;
-        break;
-      case LAN8742_STATUS_10MBITS_HALFDUPLEX:
-        duplex = ETH_HALFDUPLEX_MODE;
-        speed = ETH_SPEED_10M;
-        break;
-      default:
-        duplex = ETH_FULLDUPLEX_MODE;
-        speed = ETH_SPEED_100M;
-        break;
-      }
-
-    /* Get MAC Config MAC */
+    /* YT8512C：直接按 100M 全双工配置 MAC */
     HAL_ETH_GetMACConfig(&heth, &MACConf);
-    MACConf.DuplexMode = duplex;
-    MACConf.Speed = speed;
+    MACConf.DuplexMode = ETH_FULLDUPLEX_MODE;
+    MACConf.Speed = ETH_SPEED_100M;
     HAL_ETH_SetMACConfig(&heth, &MACConf);
 
     HAL_ETH_Start_IT(&heth);
     netif_set_up(netif);
     netif_set_link_up(netif);
-/* USER CODE BEGIN PHY_POST_CONFIG */
-
-/* USER CODE END PHY_POST_CONFIG */
-    }
-
   }
   else
   {
@@ -769,69 +789,29 @@ int32_t ETH_PHY_IO_GetTick(void)
   */
 void ethernet_link_thread(void* argument)
 {
-  ETH_MACConfigTypeDef MACConf = {0};
-  int32_t PHYLinkState = 0;
-  uint32_t linkchanged = 0U, speed = 0U, duplex = 0U;
-
+  uint32_t bmsr = 0;
   struct netif *netif = (struct netif *) argument;
-/* USER CODE BEGIN ETH link init */
-
-/* USER CODE END ETH link init */
 
   for(;;)
   {
-  PHYLinkState = LAN8742_GetLinkState(&LAN8742);
-
-  if(netif_is_link_up(netif) && (PHYLinkState <= LAN8742_STATUS_LINK_DOWN))
-  {
-    HAL_ETH_Stop_IT(&heth);
-    netif_set_down(netif);
-    netif_set_link_down(netif);
-  }
-  else if(!netif_is_link_up(netif) && (PHYLinkState > LAN8742_STATUS_LINK_DOWN))
-  {
-    switch (PHYLinkState)
+    /* 读 YT8512C 的 BMSR 寄存器(0x01)，PHY 地址 0，bit2 是 Link 状态 */
+    if (HAL_ETH_ReadPHYRegister(&heth, 0x00, 0x01, &bmsr) == HAL_OK)
     {
-    case LAN8742_STATUS_100MBITS_FULLDUPLEX:
-      duplex = ETH_FULLDUPLEX_MODE;
-      speed = ETH_SPEED_100M;
-      linkchanged = 1;
-      break;
-    case LAN8742_STATUS_100MBITS_HALFDUPLEX:
-      duplex = ETH_HALFDUPLEX_MODE;
-      speed = ETH_SPEED_100M;
-      linkchanged = 1;
-      break;
-    case LAN8742_STATUS_10MBITS_FULLDUPLEX:
-      duplex = ETH_FULLDUPLEX_MODE;
-      speed = ETH_SPEED_10M;
-      linkchanged = 1;
-      break;
-    case LAN8742_STATUS_10MBITS_HALFDUPLEX:
-      duplex = ETH_HALFDUPLEX_MODE;
-      speed = ETH_SPEED_10M;
-      linkchanged = 1;
-      break;
-    default:
-      break;
+      if ((bmsr & 0x0004u) != 0u)
+      {
+        if (!netif_is_link_up(netif))
+        {
+          netif_set_link_up(netif);
+        }
+      }
+      else
+      {
+        if (netif_is_link_up(netif))
+        {
+          netif_set_link_down(netif);
+        }
+      }
     }
-
-    if(linkchanged)
-    {
-      /* Get MAC Config MAC */
-      HAL_ETH_GetMACConfig(&heth, &MACConf);
-      MACConf.DuplexMode = duplex;
-      MACConf.Speed = speed;
-      HAL_ETH_SetMACConfig(&heth, &MACConf);
-      HAL_ETH_Start_IT(&heth);
-      netif_set_up(netif);
-      netif_set_link_up(netif);
-    }
-  }
-
-/* USER CODE BEGIN ETH link Thread core code for User BSP */
-
-/* USER CODE END ETH link Thread core code for User BSP */
 
     osDelay(100);
   }

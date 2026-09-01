@@ -1,0 +1,26 @@
+# Keil MDK - build outputs
+MDK-ARM/OTA/
+*.o
+*.axf
+*.hex
+*.map
+*.htm
+*.crf
+*.d
+*.dep
+*.lst
+*.lnp
+*.build_log.htm
+
+# Keil MDK - user/editor state
+MDK-ARM/*.uvguix.*
+MDK-ARM/*.uvoptx
+MDK-ARM/DebugConfig/
+MDK-ARM/RTE/
+MDK-ARM/.vscode/
+
+# STM32CubeMX - generated metadata (regenerated on open)
+.mxproject
+
+# Board documentation (large binaries)
+附件/

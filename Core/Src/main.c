@@ -24,6 +24,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <string.h>
+#include "lwip/sockets.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -73,7 +75,7 @@ const osMessageQueueAttr_t SensorDataQueue_attributes = {
   .name = "SensorDataQueue"
 };
 /* USER CODE BEGIN PV */
-
+volatile int lwip_ready = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -131,7 +133,6 @@ int main(void)
   printf("OTA board boot OK\r\n");
   printf("SYSCLK = %lu MHz\r\n", SystemCoreClock / 1000000UL);
   printf("FreeRTOS starting...\r\n");
-  printf("update!");
   HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin,GPIO_PIN_RESET);
   HAL_GPIO_WritePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin,GPIO_PIN_SET);
   /* USER CODE END 2 */
@@ -421,6 +422,7 @@ void StartDefaultTask(void *argument)
   /* init code for LWIP */
   MX_LWIP_Init();
   /* USER CODE BEGIN 5 */
+  lwip_ready = 1;
   /* Infinite loop */
   for(;;)
   {
@@ -457,10 +459,95 @@ void StartSensorTask(void *argument)
 void StartNetworkTask(void *argument)
 {
   /* USER CODE BEGIN StartNetworkTask */
-  /* Infinite loop */
+  int listen_fd, conn_fd;
+  struct sockaddr_in server_addr, client_addr;
+  socklen_t client_addr_len = sizeof(client_addr);
+  char rx_buf[256];
+  int rx_len;
+
+  /* 等待 LwIP 初始化完成（defaultTask 里 MX_LWIP_Init 后会置位） */
+  while (lwip_ready == 0)
+  {
+    osDelay(10);
+  }
+
+  /* 建立 TCP 监听 socket，失败就重试 */
   for(;;)
   {
-    osDelay(1);
+    listen_fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0)
+    {
+      printf("[NET] socket() error %d\r\n", listen_fd);
+      osDelay(1000);
+      continue;
+    }
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(5000);
+
+    if (lwip_bind(listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
+    {
+      printf("[NET] bind() error\r\n");
+      lwip_close(listen_fd);
+      osDelay(1000);
+      continue;
+    }
+
+    if (lwip_listen(listen_fd, 1) < 0)
+    {
+      printf("[NET] listen() error\r\n");
+      lwip_close(listen_fd);
+      osDelay(1000);
+      continue;
+    }
+
+    printf("[NET] TCP server ready, port 5000\r\n");
+    break;
+  }
+
+  /* 接受连接并处理数据 */
+  for(;;)
+  {
+    conn_fd = lwip_accept(listen_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+    if (conn_fd < 0)
+    {
+      osDelay(100);
+      continue;
+    }
+
+    printf("[NET] client connected\r\n");
+
+    for(;;)
+    {
+      rx_len = lwip_recv(conn_fd, rx_buf, sizeof(rx_buf) - 1, 0);
+      if (rx_len <= 0)
+      {
+        break;   /* 客户端断开 */
+      }
+
+      rx_buf[rx_len] = '\0';
+      printf("[NET] RX(%d): %s\r\n", rx_len, rx_buf);
+
+      if (strncmp(rx_buf, "LED_ON", 6) == 0)
+      {
+        HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_RESET);
+        lwip_send(conn_fd, "LED ON\r\n", 8, 0);
+      }
+      else if (strncmp(rx_buf, "LED_OFF", 7) == 0)
+      {
+        HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_SET);
+        lwip_send(conn_fd, "LED OFF\r\n", 9, 0);
+      }
+      else
+      {
+        lwip_send(conn_fd, rx_buf, rx_len, 0);   /* 回显 */
+      }
+    }
+
+    lwip_close(conn_fd);
+    printf("[NET] client disconnected\r\n");
   }
   /* USER CODE END StartNetworkTask */
 }

@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include "lwip/sockets.h"
 /* USER CODE END Includes */
 
@@ -46,6 +47,23 @@ typedef struct
   SensorData_t latest;
   int has_latest;
 } DeviceState_t;
+
+/* 网络状态机 */
+typedef enum
+{
+  NET_STATE_INIT = 0,
+  NET_STATE_LINK_DOWN,
+  NET_STATE_LINK_UP,
+} NetState_t;
+
+/* 日志级别 */
+typedef enum
+{
+  LOG_ERROR = 0,
+  LOG_WARN,
+  LOG_INFO,
+  LOG_DEBUG,
+} LogLevel_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -93,6 +111,22 @@ const osMessageQueueAttr_t SensorDataQueue_attributes = {
 volatile int lwip_ready = 0;
 DeviceState_t g_state = { 26.5f, {0.0f, 0.0f, 0.0f, 0u}, 0 };
 osMutexId_t g_state_mutex = NULL;
+extern struct netif gnetif;
+
+/* ===== 日志系统：环形缓冲区 + LogTask ===== */
+#define LOG_BUF_SIZE 2048u
+static char log_ring[LOG_BUF_SIZE];
+static volatile uint32_t log_rd = 0u;
+static volatile uint32_t log_wr = 0u;
+static uint32_t log_high_water = 0u;
+static osMutexId_t log_mutex = NULL;
+static LogLevel_t g_log_level = LOG_DEBUG;
+osThreadId_t LogTaskHandle = NULL;
+const osThreadAttr_t LogTask_attributes = {
+  .name = "LogTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -106,7 +140,7 @@ void StartSensorTask(void *argument);
 void StartNetworkTask(void *argument);
 
 /* USER CODE BEGIN PFP */
-
+void StartLogTask(void *argument);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -224,6 +258,22 @@ static void cmd_led_off(int conn_fd, const char *args)
   send_str(conn_fd, "LED OFF\r\n");
 }
 
+static void cmd_logstat(int conn_fd, const char *args)
+{
+  char buf[64];
+  uint32_t used, high;
+  (void)args;
+
+  osMutexAcquire(log_mutex, osWaitForever);
+  used = (log_wr - log_rd + LOG_BUF_SIZE) % LOG_BUF_SIZE;
+  high = log_high_water;
+  osMutexRelease(log_mutex);
+
+  sprintf(buf, "LOG buf used=%lu/%u high=%lu\r\n",
+          (unsigned long)used, (unsigned int)LOG_BUF_SIZE, (unsigned long)high);
+  send_str(conn_fd, buf);
+}
+
 static const CommandEntry_t cmd_table[] =
 {
   { "VERSION",   cmd_version },
@@ -233,6 +283,7 @@ static const CommandEntry_t cmd_table[] =
   { "SET_ALARM", cmd_set_alarm },
   { "LED_ON",    cmd_led_on },
   { "LED_OFF",   cmd_led_off },
+  { "LOG_STAT",  cmd_logstat },
   { NULL,        NULL }
 };
 
@@ -266,6 +317,72 @@ static void command_dispatch(int conn_fd, char *line)
   }
 
   send_str(conn_fd, "ERR unknown command\r\n");
+}
+
+/* ===== 日志系统 ===== */
+static const char *log_level_str(LogLevel_t level)
+{
+  switch (level)
+  {
+  case LOG_ERROR: return "ERR";
+  case LOG_WARN:  return "WRN";
+  case LOG_INFO:  return "INF";
+  case LOG_DEBUG: return "DBG";
+  default:        return "???";
+  }
+}
+
+/* 写一条日志到环形缓冲区，并通知 LogTask 输出 */
+void log_write(LogLevel_t level, const char *fmt, ...)
+{
+  char msg[128];
+  char line[176];
+  int n, i;
+  va_list ap;
+
+  if (level > g_log_level)
+  {
+    return;
+  }
+
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+
+  n = sprintf(line, "[%6lus][%s] %s\r\n",
+              (unsigned long)(HAL_GetTick() / 1000u), log_level_str(level), msg);
+
+  /* 日志系统还没初始化时，直接输出 */
+  if (log_mutex == NULL)
+  {
+    printf("%s", line);
+    return;
+  }
+
+  osMutexAcquire(log_mutex, osWaitForever);
+  for (i = 0; i < n; i++)
+  {
+    uint32_t next = (log_wr + 1u) % LOG_BUF_SIZE;
+    if (next == log_rd)
+    {
+      log_rd = (log_rd + 1u) % LOG_BUF_SIZE;  /* 满了，丢最旧一个字节 */
+    }
+    log_ring[log_wr] = line[i];
+    log_wr = next;
+  }
+  {
+    uint32_t used = (log_wr - log_rd + LOG_BUF_SIZE) % LOG_BUF_SIZE;
+    if (used > log_high_water)
+    {
+      log_high_water = used;
+    }
+  }
+  osMutexRelease(log_mutex);
+
+  if (LogTaskHandle != NULL)
+  {
+    osThreadFlagsSet(LogTaskHandle, 0x01u);
+  }
 }
 /* USER CODE END 0 */
 
@@ -302,9 +419,9 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USB_OTG_FS_USB_Init();
   /* USER CODE BEGIN 2 */
-  printf("OTA board boot OK\r\n");
-  printf("SYSCLK = %lu MHz\r\n", SystemCoreClock / 1000000UL);
-  printf("FreeRTOS starting...\r\n");
+  log_write(LOG_INFO, "OTA board boot OK");
+  log_write(LOG_INFO, "SYSCLK = %lu MHz", SystemCoreClock / 1000000UL);
+  log_write(LOG_INFO, "FreeRTOS starting...");
   HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin,GPIO_PIN_RESET);
   HAL_GPIO_WritePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin,GPIO_PIN_SET);
   /* USER CODE END 2 */
@@ -315,6 +432,7 @@ int main(void)
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
   g_state_mutex = osMutexNew(NULL);
+  log_mutex = osMutexNew(NULL);
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -345,6 +463,7 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
+  LogTaskHandle = osThreadNew(StartLogTask, NULL, &LogTask_attributes);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -660,13 +779,13 @@ void StartSensorTask(void *argument)
     /* 阈值判断 */
     if (data.temperature > alarm_thr)
     {
-      printf("[SENSOR] high temperature alarm!\r\n");
+      log_write(LOG_WARN, "high temperature alarm!");
     }
 
     /* 放进消息队列，交给 NetworkTask */
     if (osMessageQueuePut(SensorDataQueueHandle, &data, 0u, 0u) != osOK)
     {
-      printf("[SENSOR] queue full\r\n");
+      log_write(LOG_WARN, "sensor queue full");
     }
 
     idx++;
@@ -694,6 +813,10 @@ void StartNetworkTask(void *argument)
   char t_str[8], h_str[8], a_str[8];
   int rx_len, tx_len, flags;
   SensorData_t sensor_data;
+  NetState_t net_state = NET_STATE_INIT;
+  uint32_t last_link_check = 0u;
+  uint32_t last_hb = 0u;
+  uint32_t hb_seq = 0u;
 
   /* 等待 LwIP 初始化完成（defaultTask 里 MX_LWIP_Init 后会置位） */
   while (lwip_ready == 0)
@@ -707,7 +830,7 @@ void StartNetworkTask(void *argument)
     listen_fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0)
     {
-      printf("[NET] socket() error %d\r\n", listen_fd);
+      log_write(LOG_ERROR, "TCP socket() error %d", listen_fd);
       osDelay(1000);
       continue;
     }
@@ -719,7 +842,7 @@ void StartNetworkTask(void *argument)
 
     if (lwip_bind(listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
     {
-      printf("[NET] bind() error\r\n");
+      log_write(LOG_ERROR, "TCP bind() error");
       lwip_close(listen_fd);
       osDelay(1000);
       continue;
@@ -727,7 +850,7 @@ void StartNetworkTask(void *argument)
 
     if (lwip_listen(listen_fd, 1) < 0)
     {
-      printf("[NET] listen() error\r\n");
+      log_write(LOG_ERROR, "TCP listen() error");
       lwip_close(listen_fd);
       osDelay(1000);
       continue;
@@ -737,7 +860,7 @@ void StartNetworkTask(void *argument)
     flags = lwip_fcntl(listen_fd, F_GETFL, 0);
     lwip_fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK);
 
-    printf("[NET] TCP server ready, port 5000\r\n");
+    log_write(LOG_INFO, "TCP server ready, port 5000");
     break;
   }
 
@@ -750,11 +873,11 @@ void StartNetworkTask(void *argument)
     IP4_ADDR(&udp_ip, 192, 168, 31, 121);
     udp_dst.sin_addr.s_addr = udp_ip.addr;
     udp_dst.sin_port = htons(6000);
-    printf("[NET] UDP report target 192.168.31.121:6000\r\n");
+    log_write(LOG_INFO, "UDP report target 192.168.31.121:6000");
   }
   else
   {
-    printf("[NET] UDP socket() error %d\r\n", udp_fd);
+    log_write(LOG_ERROR, "UDP socket() error %d", udp_fd);
   }
 
   /* 事件循环：接受连接 + 处理命令 + 通过 UDP 上报传感器数据 */
@@ -766,7 +889,7 @@ void StartNetworkTask(void *argument)
       conn_fd = lwip_accept(listen_fd, (struct sockaddr *)&client_addr, &client_addr_len);
       if (conn_fd >= 0)
       {
-        printf("[NET] client connected\r\n");
+        log_write(LOG_INFO, "client connected");
         flags = lwip_fcntl(conn_fd, F_GETFL, 0);
         lwip_fcntl(conn_fd, F_SETFL, flags | O_NONBLOCK);
       }
@@ -779,7 +902,7 @@ void StartNetworkTask(void *argument)
       if (rx_len > 0)
       {
         rx_buf[rx_len] = '\0';
-        printf("[NET] RX(%d): %s\r\n", rx_len, rx_buf);
+        log_write(LOG_DEBUG, "RX(%d): %s", rx_len, rx_buf);
 
         command_dispatch(conn_fd, rx_buf);
       }
@@ -787,7 +910,7 @@ void StartNetworkTask(void *argument)
       {
         lwip_close(conn_fd);
         conn_fd = -1;
-        printf("[NET] client disconnected\r\n");
+        log_write(LOG_INFO, "client disconnected");
       }
       /* rx_len < 0：非阻塞模式下无数据，忽略 */
     }
@@ -805,12 +928,86 @@ void StartNetworkTask(void *argument)
         lwip_sendto(udp_fd, tx_line, tx_len, 0,
                     (struct sockaddr *)&udp_dst, sizeof(udp_dst));
       }
-      printf("[NET] UDP report: %s", tx_line);
+      log_write(LOG_DEBUG, "UDP report sent");
+    }
+
+    /* 4. 网络状态机 + 心跳 */
+    {
+      uint32_t now = HAL_GetTick();
+      NetState_t s;
+
+      /* 每 500ms 检查一次链路状态，只在变化时报告 */
+      if (now - last_link_check >= 500u)
+      {
+        last_link_check = now;
+        s = netif_is_link_up(&gnetif) ? NET_STATE_LINK_UP : NET_STATE_LINK_DOWN;
+        if (s != net_state)
+        {
+          net_state = s;
+          log_write(LOG_INFO, "link state: %s", (s == NET_STATE_LINK_UP) ? "LINK_UP" : "LINK_DOWN");
+        }
+      }
+
+      /* 每 5 秒发一次心跳 */
+      if (now - last_hb >= 5000u)
+      {
+        last_hb = now;
+        hb_seq++;
+        tx_len = sprintf(tx_line, "HB seq=%lu uptime=%lu\r\n",
+                         (unsigned long)hb_seq, (unsigned long)(HAL_GetTick() / 1000u));
+        if (udp_fd >= 0)
+        {
+          lwip_sendto(udp_fd, tx_line, tx_len, 0,
+                      (struct sockaddr *)&udp_dst, sizeof(udp_dst));
+        }
+        log_write(LOG_DEBUG, "heartbeat seq=%lu", (unsigned long)hb_seq);
+      }
     }
 
     osDelay(10);
   }
   /* USER CODE END StartNetworkTask */
+}
+
+/* USER CODE BEGIN Header_StartLogTask */
+/**
+* @brief 日志输出任务：等待通知后把环形缓冲区里的日志打印到串口。
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartLogTask */
+void StartLogTask(void *argument)
+{
+  char chunk[128];
+  (void)argument;
+
+  for(;;)
+  {
+    /* 等任意任务写完日志后通知 */
+    osThreadFlagsWait(0x01u, osFlagsWaitAny, osWaitForever);
+
+    /* 把当前缓冲区里的所有日志都打印出来 */
+    for(;;)
+    {
+      uint32_t n = 0u;
+
+      osMutexAcquire(log_mutex, osWaitForever);
+      while (n < sizeof(chunk) - 1u && log_rd != log_wr)
+      {
+        chunk[n++] = log_ring[log_rd];
+        log_rd = (log_rd + 1u) % LOG_BUF_SIZE;
+      }
+      osMutexRelease(log_mutex);
+
+      if (n == 0u)
+      {
+        break;
+      }
+
+      chunk[n] = '\0';
+      printf("%s", chunk);
+    }
+  }
 }
 
 /**

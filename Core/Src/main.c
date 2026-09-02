@@ -30,7 +30,13 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef struct
+{
+  float temperature;
+  float humidity;
+  float air_quality;
+  uint32_t timestamp;
+} SensorData_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -94,7 +100,22 @@ void StartNetworkTask(void *argument);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
+/* MicroLIB 的 printf 不支持 %f，这里把 float 转成 "xx.x" 文本 */
+static void ftoa_1(char *buf, float v)
+{
+  int ip = (int)v;
+  int dp = (int)((v - (float)ip) * 10.0f + 0.5f);
+  if (dp < 0)
+  {
+    dp = -dp;
+  }
+  if (dp >= 10)
+  {
+    dp = 0;
+    ip++;
+  }
+  sprintf(buf, "%d.%d", ip, dp);
+}
 /* USER CODE END 0 */
 
 /**
@@ -441,10 +462,55 @@ void StartDefaultTask(void *argument)
 void StartSensorTask(void *argument)
 {
   /* USER CODE BEGIN StartSensorTask */
-  /* Infinite loop */
+  SensorData_t data;
+  float temp_hist[5] = {0.0f};
+  float humi_hist[5] = {0.0f};
+  float temp_raw, humi_raw, air_raw;
+  float temp_sum, humi_sum;
+  uint32_t rng = 12345u;
+  uint32_t idx = 0u;
+  uint32_t i;
+
   for(;;)
   {
-    osDelay(1);
+    /* 模拟传感器原始值（真实项目里这里替换成实际传感器读取） */
+    rng = rng * 1103515245u + 12345u;
+    temp_raw = 25.0f + 2.0f * ((float)((rng >> 16) & 0x7FFFu) / 32767.0f);
+    rng = rng * 1103515245u + 12345u;
+    humi_raw = 55.0f + 10.0f * ((float)((rng >> 16) & 0x7FFFu) / 32767.0f);
+    rng = rng * 1103515245u + 12345u;
+    air_raw  = 60.0f + 40.0f * ((float)((rng >> 16) & 0x7FFFu) / 32767.0f);
+
+    /* 滑动平均滤波（窗口 5） */
+    temp_hist[idx % 5u] = temp_raw;
+    humi_hist[idx % 5u] = humi_raw;
+    temp_sum = 0.0f;
+    humi_sum = 0.0f;
+    for (i = 0u; i < 5u; i++)
+    {
+      temp_sum += temp_hist[i];
+      humi_sum += humi_hist[i];
+    }
+
+    data.temperature = temp_sum / 5.0f;
+    data.humidity    = humi_sum / 5.0f;
+    data.air_quality = air_raw;
+    data.timestamp   = HAL_GetTick() / 1000u;
+
+    /* 阈值判断：温度超过 26.5 报警 */
+    if (data.temperature > 26.5f)
+    {
+      printf("[SENSOR] high temperature alarm!\r\n");
+    }
+
+    /* 放进消息队列，交给 NetworkTask */
+    if (osMessageQueuePut(SensorDataQueueHandle, &data, 0u, 0u) != osOK)
+    {
+      printf("[SENSOR] queue full\r\n");
+    }
+
+    idx++;
+    osDelay(5000);
   }
   /* USER CODE END StartSensorTask */
 }
@@ -459,11 +525,14 @@ void StartSensorTask(void *argument)
 void StartNetworkTask(void *argument)
 {
   /* USER CODE BEGIN StartNetworkTask */
-  int listen_fd, conn_fd;
+  int listen_fd = -1, conn_fd = -1;
   struct sockaddr_in server_addr, client_addr;
   socklen_t client_addr_len = sizeof(client_addr);
   char rx_buf[256];
-  int rx_len;
+  char tx_line[128];
+  char t_str[8], h_str[8], a_str[8];
+  int rx_len, tx_len, flags;
+  SensorData_t sensor_data;
 
   /* 等待 LwIP 初始化完成（defaultTask 里 MX_LWIP_Init 后会置位） */
   while (lwip_ready == 0)
@@ -503,51 +572,78 @@ void StartNetworkTask(void *argument)
       continue;
     }
 
+    /* 把监听 socket 设为非阻塞 */
+    flags = lwip_fcntl(listen_fd, F_GETFL, 0);
+    lwip_fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK);
+
     printf("[NET] TCP server ready, port 5000\r\n");
     break;
   }
 
-  /* 接受连接并处理数据 */
+  /* 事件循环：接受连接 + 处理命令 + 上报队列里的传感器数据 */
   for(;;)
   {
-    conn_fd = lwip_accept(listen_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+    /* 1. 接受连接（非阻塞） */
     if (conn_fd < 0)
     {
-      osDelay(100);
-      continue;
+      conn_fd = lwip_accept(listen_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+      if (conn_fd >= 0)
+      {
+        printf("[NET] client connected\r\n");
+        flags = lwip_fcntl(conn_fd, F_GETFL, 0);
+        lwip_fcntl(conn_fd, F_SETFL, flags | O_NONBLOCK);
+      }
     }
 
-    printf("[NET] client connected\r\n");
-
-    for(;;)
+    /* 2. 收命令（非阻塞） */
+    if (conn_fd >= 0)
     {
       rx_len = lwip_recv(conn_fd, rx_buf, sizeof(rx_buf) - 1, 0);
-      if (rx_len <= 0)
+      if (rx_len > 0)
       {
-        break;   /* 客户端断开 */
-      }
+        rx_buf[rx_len] = '\0';
+        printf("[NET] RX(%d): %s\r\n", rx_len, rx_buf);
 
-      rx_buf[rx_len] = '\0';
-      printf("[NET] RX(%d): %s\r\n", rx_len, rx_buf);
+        if (strncmp(rx_buf, "LED_ON", 6) == 0)
+        {
+          HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_RESET);
+          lwip_send(conn_fd, "LED ON\r\n", 8, 0);
+        }
+        else if (strncmp(rx_buf, "LED_OFF", 7) == 0)
+        {
+          HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_SET);
+          lwip_send(conn_fd, "LED OFF\r\n", 9, 0);
+        }
+        else
+        {
+          lwip_send(conn_fd, rx_buf, rx_len, 0);
+        }
+      }
+      else if (rx_len == 0)
+      {
+        lwip_close(conn_fd);
+        conn_fd = -1;
+        printf("[NET] client disconnected\r\n");
+      }
+      /* rx_len < 0：非阻塞模式下无数据，忽略 */
+    }
 
-      if (strncmp(rx_buf, "LED_ON", 6) == 0)
+    /* 3. 从队列取传感器数据，上报给客户端 */
+    if (osMessageQueueGet(SensorDataQueueHandle, &sensor_data, NULL, 0u) == osOK)
+    {
+      if (conn_fd >= 0)
       {
-        HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_RESET);
-        lwip_send(conn_fd, "LED ON\r\n", 8, 0);
-      }
-      else if (strncmp(rx_buf, "LED_OFF", 7) == 0)
-      {
-        HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_SET);
-        lwip_send(conn_fd, "LED OFF\r\n", 9, 0);
-      }
-      else
-      {
-        lwip_send(conn_fd, rx_buf, rx_len, 0);   /* 回显 */
+        ftoa_1(t_str, sensor_data.temperature);
+        ftoa_1(h_str, sensor_data.humidity);
+        ftoa_1(a_str, sensor_data.air_quality);
+        tx_len = sprintf(tx_line, "T=%s H=%s A=%s TS=%lu\r\n",
+                         t_str, h_str, a_str, (unsigned long)sensor_data.timestamp);
+        lwip_send(conn_fd, tx_line, tx_len, 0);
+        printf("[NET] report: %s", tx_line);
       }
     }
 
-    lwip_close(conn_fd);
-    printf("[NET] client disconnected\r\n");
+    osDelay(10);
   }
   /* USER CODE END StartNetworkTask */
 }

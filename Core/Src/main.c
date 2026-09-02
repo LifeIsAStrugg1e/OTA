@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "cmsis_os.h"
+#include "fatfs.h"
 #include "lwip.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -77,6 +78,8 @@ typedef enum
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+SD_HandleTypeDef hsd;
+
 SPI_HandleTypeDef hspi5;
 
 UART_HandleTypeDef huart1;
@@ -135,6 +138,7 @@ static void MX_GPIO_Init(void);
 static void MX_SPI5_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USB_OTG_FS_USB_Init(void);
+static void MX_SDIO_SD_Init(void);
 void StartDefaultTask(void *argument);
 void StartSensorTask(void *argument);
 void StartNetworkTask(void *argument);
@@ -260,8 +264,9 @@ static void cmd_led_off(int conn_fd, const char *args)
 
 static void cmd_logstat(int conn_fd, const char *args)
 {
-  char buf[64];
+  char buf[96];
   uint32_t used, high;
+  DWORD fsize = 0;
   (void)args;
 
   osMutexAcquire(log_mutex, osWaitForever);
@@ -269,9 +274,68 @@ static void cmd_logstat(int conn_fd, const char *args)
   high = log_high_water;
   osMutexRelease(log_mutex);
 
-  sprintf(buf, "LOG buf used=%lu/%u high=%lu\r\n",
-          (unsigned long)used, (unsigned int)LOG_BUF_SIZE, (unsigned long)high);
+  if (sd_log_ok)
+  {
+    fsize = (DWORD)f_size(&sd_log_file);
+  }
+
+  sprintf(buf, "LOG buf used=%lu/%u high=%lu file=%lu\r\n",
+          (unsigned long)used, (unsigned int)LOG_BUF_SIZE,
+          (unsigned long)high, (unsigned long)fsize);
   send_str(conn_fd, buf);
+}
+
+static void cmd_log_read(int conn_fd, const char *args)
+{
+  FIL f;
+  char buf[256];
+  UINT br;
+  FRESULT res;
+  int max_bytes = 4096;
+  int sent = 0;
+  (void)args;
+
+  if (!sd_log_ok)
+  {
+    send_str(conn_fd, "LOG_READ: SD log not ready\r\n");
+    return;
+  }
+
+  /* 先把正在写的文件同步落盘 */
+  f_sync(&sd_log_file);
+
+  res = f_open(&f, "0:/log.txt", FA_READ);
+  if (res != FR_OK)
+  {
+    send_str(conn_fd, "LOG_READ: open failed\r\n");
+    return;
+  }
+
+  while (sent < max_bytes)
+  {
+    res = f_read(&f, buf, sizeof(buf), &br);
+    if (res != FR_OK || br == 0u)
+    {
+      break;
+    }
+    lwip_send(conn_fd, buf, br, 0);
+    sent += (int)br;
+  }
+
+  f_close(&f);
+  send_str(conn_fd, "\r\n-- LOG END --\r\n");
+}
+
+static void cmd_test_hang(int conn_fd, const char *args)
+{
+  (void)args;
+  send_str(conn_fd, "hanging, reset in ~4s\r\n");
+
+  /* 故意死循环，停止喂狗，约 4 秒后 IWDG 复位整个系统 */
+  while (1)
+  {
+    __NOP();
+  }
 }
 
 static const CommandEntry_t cmd_table[] =
@@ -284,6 +348,8 @@ static const CommandEntry_t cmd_table[] =
   { "LED_ON",    cmd_led_on },
   { "LED_OFF",   cmd_led_off },
   { "LOG_STAT",  cmd_logstat },
+  { "LOG_READ",  cmd_log_read },
+  { "TEST_HANG", cmd_test_hang },
   { NULL,        NULL }
 };
 
@@ -384,6 +450,36 @@ void log_write(LogLevel_t level, const char *fmt, ...)
     osThreadFlagsSet(LogTaskHandle, 0x01u);
   }
 }
+
+/* ===== IWDG 独立看门狗（直接操作寄存器，超时约 4 秒） ===== */
+static void IWDG_Start(void)
+{
+  /* 1. 使能 LSI（IWDG 的时钟源，约 32kHz） */
+  RCC->CSR |= RCC_CSR_LSION;
+  while ((RCC->CSR & RCC_CSR_LSIRDY) == 0u)
+  {
+  }
+
+  /* 2. 解锁 PR / RLR 寄存器 */
+  IWDG->KR = 0x5555u;
+
+  /* 3. 预分频 /64：32kHz / 64 = 500Hz，每 tick 2ms */
+  IWDG->PR = 0x04u;
+
+  /* 4. 重装载值 2000：2000 * 2ms = 4 秒 */
+  IWDG->RLR = 2000u;
+
+  /* 5. 启动 IWDG（一旦启动无法停止，只能复位） */
+  IWDG->KR = 0xCCCCu;
+
+  /* 6. 首次喂狗 */
+  IWDG->KR = 0xAAAAu;
+}
+
+static void IWDG_Feed(void)
+{
+  IWDG->KR = 0xAAAAu;
+}
 /* USER CODE END 0 */
 
 /**
@@ -418,12 +514,15 @@ int main(void)
   MX_SPI5_Init();
   MX_USART1_UART_Init();
   MX_USB_OTG_FS_USB_Init();
+  MX_SDIO_SD_Init();
+  MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
   log_write(LOG_INFO, "OTA board boot OK");
   log_write(LOG_INFO, "SYSCLK = %lu MHz", SystemCoreClock / 1000000UL);
   log_write(LOG_INFO, "FreeRTOS starting...");
   HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin,GPIO_PIN_RESET);
   HAL_GPIO_WritePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin,GPIO_PIN_SET);
+  IWDG_Start();
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -529,6 +628,34 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief SDIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SDIO_SD_Init(void)
+{
+
+  /* USER CODE BEGIN SDIO_Init 0 */
+
+  /* USER CODE END SDIO_Init 0 */
+
+  /* USER CODE BEGIN SDIO_Init 1 */
+
+  /* USER CODE END SDIO_Init 1 */
+  hsd.Instance = SDIO;
+  hsd.Init.ClockEdge = SDIO_CLOCK_EDGE_RISING;
+  hsd.Init.ClockBypass = SDIO_CLOCK_BYPASS_DISABLE;
+  hsd.Init.ClockPowerSave = SDIO_CLOCK_POWER_SAVE_DISABLE;
+  hsd.Init.BusWide = SDIO_BUS_WIDE_1B;
+  hsd.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
+  hsd.Init.ClockDiv = 0;
+  /* USER CODE BEGIN SDIO_Init 2 */
+
+  /* USER CODE END SDIO_Init 2 */
+
 }
 
 /**
@@ -641,6 +768,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
@@ -700,6 +828,51 @@ int fputc(int ch, FILE *f)
   HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
   return ch;
 }
+
+/* 日志输出任务：等通知后把环形缓冲区里的日志打印到串口，并写到 SD 卡 */
+void StartLogTask(void *argument)
+{
+  char chunk[128];
+  UINT bw = 0u;
+  (void)argument;
+
+  for(;;)
+  {
+    osThreadFlagsWait(0x01u, osFlagsWaitAny, osWaitForever);
+
+    for(;;)
+    {
+      uint32_t n = 0u;
+
+      osMutexAcquire(log_mutex, osWaitForever);
+      while (n < sizeof(chunk) - 1u && log_rd != log_wr)
+      {
+        chunk[n++] = log_ring[log_rd];
+        log_rd = (log_rd + 1u) % LOG_BUF_SIZE;
+      }
+      osMutexRelease(log_mutex);
+
+      if (n == 0u)
+      {
+        break;
+      }
+
+      chunk[n] = '\0';
+      printf("%s", chunk);
+
+      if (sd_log_ok)
+      {
+        f_write(&sd_log_file, chunk, n, &bw);
+      }
+    }
+
+    /* 每批日志写完同步一次，避免掉电丢数据 */
+    if (sd_log_ok)
+    {
+      f_sync(&sd_log_file);
+    }
+  }
+}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -715,10 +888,31 @@ void StartDefaultTask(void *argument)
   MX_LWIP_Init();
   /* USER CODE BEGIN 5 */
   lwip_ready = 1;
-  /* Infinite loop */
+  IWDG_Feed();
+
+  /* 挂载 SD 卡并打开日志文件（必须在调度器启动之后） */
+  if (f_mount(&SDFatFS, SDPath, 1) == FR_OK)
+  {
+    if (f_open(&sd_log_file, "0:/log.txt", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK)
+    {
+      sd_log_ok = 1;
+      log_write(LOG_INFO, "SD log ready");
+    }
+    else
+    {
+      log_write(LOG_ERROR, "SD log open failed");
+    }
+  }
+  else
+  {
+    log_write(LOG_ERROR, "SD mount failed");
+  }
+
+  /* Infinite loop：每 1 秒喂一次狗 */
   for(;;)
   {
-    osDelay(1);
+    IWDG_Feed();
+    osDelay(1000);
   }
   /* USER CODE END 5 */
 }
@@ -967,47 +1161,6 @@ void StartNetworkTask(void *argument)
     osDelay(10);
   }
   /* USER CODE END StartNetworkTask */
-}
-
-/* USER CODE BEGIN Header_StartLogTask */
-/**
-* @brief 日志输出任务：等待通知后把环形缓冲区里的日志打印到串口。
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_StartLogTask */
-void StartLogTask(void *argument)
-{
-  char chunk[128];
-  (void)argument;
-
-  for(;;)
-  {
-    /* 等任意任务写完日志后通知 */
-    osThreadFlagsWait(0x01u, osFlagsWaitAny, osWaitForever);
-
-    /* 把当前缓冲区里的所有日志都打印出来 */
-    for(;;)
-    {
-      uint32_t n = 0u;
-
-      osMutexAcquire(log_mutex, osWaitForever);
-      while (n < sizeof(chunk) - 1u && log_rd != log_wr)
-      {
-        chunk[n++] = log_ring[log_rd];
-        log_rd = (log_rd + 1u) % LOG_BUF_SIZE;
-      }
-      osMutexRelease(log_mutex);
-
-      if (n == 0u)
-      {
-        break;
-      }
-
-      chunk[n] = '\0';
-      printf("%s", chunk);
-    }
-  }
 }
 
 /**

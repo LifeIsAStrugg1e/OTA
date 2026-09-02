@@ -52,6 +52,9 @@
 4. ✅ **数据流打通**：SensorTask（模拟数据 + 滑动平均滤波 + 阈值报警）→ SensorDataQueue → NetworkTask → TCP 上报 `T=xx.x H=xx.x A=xx.x TS=xx`（当前 5 秒一条）。
 5. ✅ **命令系统**：函数指针命令表 + mutex 远程配置。命令：`VERSION`/`UPTIME`/`SENSOR`/`STATUS`/`SET_ALARM`/`LED_ON`/`LED_OFF`。
 6. ✅ **UDP 数据上报**：TCP(5000) 管命令 + UDP(6000) 管数据，双通道架构。
+7. ✅ **日志系统**：环形缓冲区(2KB) + LogTask(最低优先级, 任务通知唤醒) + 分级(ERR/WRN/INF/DBG) + 时间戳；`LOG_STAT` 查占用与高水位。
+8. ✅ **IWDG 看门狗**：4 秒超时，defaultTask 每 1s 喂狗；`TEST_HANG` 命令触发死循环验证自动复位。
+9. ✅ **SD 卡日志存储**：FATFS + SDIO 4位；日志同时写串口和 `0:/log.txt`；`LOG_READ` 远程读回日志、`LOG_STAT` 显示文件大小。
 
 ## 五、关键代码位置
 
@@ -61,7 +64,9 @@
   - `fputc()`（printf 串口重定向）。
   - `StartDefaultTask()`：`MX_LWIP_Init()` 后置 `lwip_ready=1`。
   - `StartSensorTask()`：模拟采集 + 滑动平均滤波(窗口5) + 阈值(>26.5℃) + `osMessageQueuePut`。
-  - `StartNetworkTask()`：TCP 服务器 + 非阻塞事件循环（accept/recv/队列上报）。
+  - `StartNetworkTask()`：TCP 服务器 + 非阻塞事件循环（accept/recv/UDP 上报/状态机/心跳）。
+  - `StartLogTask()`：日志输出任务（等任务通知 → 环形缓冲区 → printf）。
+  - `IWDG_Start()/IWDG_Feed()`：直接操作寄存器启动/喂独立看门狗。
 - `LWIP/Target/ethernetif.c`
   - 软件 I2C + `PCF8574_Write()` + `ETH_PHY_Reset()`（释放 PHY 复位）。
   - 通用 BMSR 链路检测（**替换了 CubeMX 生成的 LAN8742 代码**）。
@@ -78,16 +83,20 @@
 5. **USART1 RX 引脚错误（待修）**：当前 RX 配成 PB7，但板子串口 RX 在 PA10；现在只发不收不影响，做命令接收/CLI 时要改回 PA10。
 6. **任务初始化顺序**：NetworkTask 优先级高于 defaultTask，靠 `lwip_ready` 标志等 LwIP 初始化完成后再创建 socket。
 7. **软件 I2C 用 HAL_Delay(1)** 做位延时，只在启动时跑一次，慢一点没关系。
+8. **CubeMX 重新生成会覆盖这些改动（都在生成区，生成后要恢复）**：
+   - `ethernetif.c`：链路检测（LAN8742 → 通用 BMSR）
+   - `FreeRTOSConfig.h`：`configENABLE_FPU=1`
+   - `FATFS/Target/sd_diskio.c`：SD 读写 DMA → 轮询
+   - `FATFS/Target/ffconf.h`：`_FS_LOCK=0`（允许同文件同时读写）
+   （静态 IP 已放在 lwip.c 的 USER CODE 区，不会被覆盖）
+9. **FatFs f_mount 要在调度器启动后**：`SD_initialize` 会检查 `osKernelRunning`，所以挂载 + 打开日志文件移到 defaultTask，不能放 MX_FATFS_Init。
+10. **SDIO DMA 没配 + SD 卡要 FAT32**：工程没配 SDIO DMA，所以 sd_diskio 改成轮询；exFAT 不支持（_FS_EXFAT=0）。
 
 ## 七、待完成（路线图）
 
-1. 【下一步】网络增强：心跳、断线重连、网络状态机。
-2. 日志系统：环形缓冲区 + LogTask + 分级 + 时间戳。
-3. 看门狗 + 故障恢复。
-4. SD 卡日志存储（FATFS）。
-5. OTA 远程升级（Bootloader + 双区 + VTOR）。
-6. 性能/内存分析：任务栈高水位、FreeRTOS 运行统计、内存泄漏排查。
-7. 面试准备（原始需求里有 33 道题，见下文）。
+1. 【下一步】OTA 远程升级（Bootloader + 双区 + VTOR）。
+2. 性能/内存分析：任务栈高水位、FreeRTOS 运行统计。
+3. 面试准备（原始需求里有 33 道题，见下文）。
 
 ## 八、测试方式速查
 

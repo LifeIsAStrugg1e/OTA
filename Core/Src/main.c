@@ -25,6 +25,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "lwip/sockets.h"
 /* USER CODE END Includes */
 
@@ -37,6 +38,14 @@ typedef struct
   float air_quality;
   uint32_t timestamp;
 } SensorData_t;
+
+/* 共享设备状态：用互斥锁保护 */
+typedef struct
+{
+  float alarm_threshold;
+  SensorData_t latest;
+  int has_latest;
+} DeviceState_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -82,6 +91,8 @@ const osMessageQueueAttr_t SensorDataQueue_attributes = {
 };
 /* USER CODE BEGIN PV */
 volatile int lwip_ready = 0;
+DeviceState_t g_state = { 26.5f, {0.0f, 0.0f, 0.0f, 0u}, 0 };
+osMutexId_t g_state_mutex = NULL;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -115,6 +126,146 @@ static void ftoa_1(char *buf, float v)
     ip++;
   }
   sprintf(buf, "%d.%d", ip, dp);
+}
+
+/* ===== 命令处理：函数指针 + 命令表 ===== */
+#define FW_VERSION "1.0.0"
+
+typedef struct
+{
+  const char *name;
+  void (*handler)(int conn_fd, const char *args);
+} CommandEntry_t;
+
+static void send_str(int conn_fd, const char *s)
+{
+  lwip_send(conn_fd, s, strlen(s), 0);
+}
+
+static void cmd_version(int conn_fd, const char *args)
+{
+  (void)args;
+  send_str(conn_fd, "OTA v" FW_VERSION "\r\n");
+}
+
+static void cmd_uptime(int conn_fd, const char *args)
+{
+  char buf[32];
+  (void)args;
+  sprintf(buf, "UPTIME=%lu s\r\n", (unsigned long)(HAL_GetTick() / 1000u));
+  send_str(conn_fd, buf);
+}
+
+static void cmd_sensor(int conn_fd, const char *args)
+{
+  char buf[96], t[8], h[8], a[8];
+  SensorData_t d;
+  int has;
+  (void)args;
+
+  osMutexAcquire(g_state_mutex, osWaitForever);
+  d = g_state.latest;
+  has = g_state.has_latest;
+  osMutexRelease(g_state_mutex);
+
+  if (!has)
+  {
+    send_str(conn_fd, "SENSOR: no data yet\r\n");
+    return;
+  }
+
+  ftoa_1(t, d.temperature);
+  ftoa_1(h, d.humidity);
+  ftoa_1(a, d.air_quality);
+  sprintf(buf, "SENSOR T=%s H=%s A=%s TS=%lu\r\n", t, h, a, (unsigned long)d.timestamp);
+  send_str(conn_fd, buf);
+}
+
+static void cmd_status(int conn_fd, const char *args)
+{
+  char buf[64];
+  (void)args;
+  sprintf(buf, "IP=192.168.31.20 PORT=5000 UPTIME=%lu s\r\n",
+          (unsigned long)(HAL_GetTick() / 1000u));
+  send_str(conn_fd, buf);
+}
+
+static void cmd_set_alarm(int conn_fd, const char *args)
+{
+  char buf[32];
+  int val;
+
+  if (args == NULL || *args == '\0')
+  {
+    send_str(conn_fd, "USAGE: SET_ALARM <temp>\r\n");
+    return;
+  }
+
+  val = atoi(args);
+  osMutexAcquire(g_state_mutex, osWaitForever);
+  g_state.alarm_threshold = (float)val;
+  osMutexRelease(g_state_mutex);
+
+  sprintf(buf, "ALARM set to %d C\r\n", val);
+  send_str(conn_fd, buf);
+}
+
+static void cmd_led_on(int conn_fd, const char *args)
+{
+  (void)args;
+  HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_RESET);
+  send_str(conn_fd, "LED ON\r\n");
+}
+
+static void cmd_led_off(int conn_fd, const char *args)
+{
+  (void)args;
+  HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_SET);
+  send_str(conn_fd, "LED OFF\r\n");
+}
+
+static const CommandEntry_t cmd_table[] =
+{
+  { "VERSION",   cmd_version },
+  { "UPTIME",    cmd_uptime },
+  { "SENSOR",    cmd_sensor },
+  { "STATUS",    cmd_status },
+  { "SET_ALARM", cmd_set_alarm },
+  { "LED_ON",    cmd_led_on },
+  { "LED_OFF",   cmd_led_off },
+  { NULL,        NULL }
+};
+
+static void command_dispatch(int conn_fd, char *line)
+{
+  char *cmd, *args = NULL, *sp;
+  size_t len = strlen(line);
+  uint32_t i;
+
+  /* 去掉行尾 \r / \n */
+  while (len > 0u && (line[len - 1u] == '\r' || line[len - 1u] == '\n'))
+  {
+    line[--len] = '\0';
+  }
+
+  cmd = line;
+  sp = strchr(cmd, ' ');
+  if (sp != NULL)
+  {
+    *sp = '\0';
+    args = sp + 1;
+  }
+
+  for (i = 0u; cmd_table[i].name != NULL; i++)
+  {
+    if (strcmp(cmd_table[i].name, cmd) == 0)
+    {
+      cmd_table[i].handler(conn_fd, args);
+      return;
+    }
+  }
+
+  send_str(conn_fd, "ERR unknown command\r\n");
 }
 /* USER CODE END 0 */
 
@@ -163,6 +314,7 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
+  g_state_mutex = osMutexNew(NULL);
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -467,6 +619,7 @@ void StartSensorTask(void *argument)
   float humi_hist[5] = {0.0f};
   float temp_raw, humi_raw, air_raw;
   float temp_sum, humi_sum;
+  float alarm_thr;
   uint32_t rng = 12345u;
   uint32_t idx = 0u;
   uint32_t i;
@@ -497,8 +650,15 @@ void StartSensorTask(void *argument)
     data.air_quality = air_raw;
     data.timestamp   = HAL_GetTick() / 1000u;
 
-    /* 阈值判断：温度超过 26.5 报警 */
-    if (data.temperature > 26.5f)
+    /* 更新共享状态，并读取报警阈值（互斥锁保护） */
+    osMutexAcquire(g_state_mutex, osWaitForever);
+    g_state.latest = data;
+    g_state.has_latest = 1;
+    alarm_thr = g_state.alarm_threshold;
+    osMutexRelease(g_state_mutex);
+
+    /* 阈值判断 */
+    if (data.temperature > alarm_thr)
     {
       printf("[SENSOR] high temperature alarm!\r\n");
     }
@@ -604,20 +764,7 @@ void StartNetworkTask(void *argument)
         rx_buf[rx_len] = '\0';
         printf("[NET] RX(%d): %s\r\n", rx_len, rx_buf);
 
-        if (strncmp(rx_buf, "LED_ON", 6) == 0)
-        {
-          HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_RESET);
-          lwip_send(conn_fd, "LED ON\r\n", 8, 0);
-        }
-        else if (strncmp(rx_buf, "LED_OFF", 7) == 0)
-        {
-          HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_SET);
-          lwip_send(conn_fd, "LED OFF\r\n", 9, 0);
-        }
-        else
-        {
-          lwip_send(conn_fd, rx_buf, rx_len, 0);
-        }
+        command_dispatch(conn_fd, rx_buf);
       }
       else if (rx_len == 0)
       {

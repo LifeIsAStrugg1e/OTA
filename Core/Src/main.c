@@ -685,8 +685,9 @@ void StartSensorTask(void *argument)
 void StartNetworkTask(void *argument)
 {
   /* USER CODE BEGIN StartNetworkTask */
-  int listen_fd = -1, conn_fd = -1;
-  struct sockaddr_in server_addr, client_addr;
+  int listen_fd = -1, conn_fd = -1, udp_fd = -1;
+  struct sockaddr_in server_addr, client_addr, udp_dst;
+  ip4_addr_t udp_ip;
   socklen_t client_addr_len = sizeof(client_addr);
   char rx_buf[256];
   char tx_line[128];
@@ -740,7 +741,23 @@ void StartNetworkTask(void *argument)
     break;
   }
 
-  /* 事件循环：接受连接 + 处理命令 + 上报队列里的传感器数据 */
+  /* 创建 UDP socket，用于周期上报传感器数据（目标：电脑 192.168.31.121:6000） */
+  udp_fd = lwip_socket(AF_INET, SOCK_DGRAM, 0);
+  if (udp_fd >= 0)
+  {
+    memset(&udp_dst, 0, sizeof(udp_dst));
+    udp_dst.sin_family = AF_INET;
+    IP4_ADDR(&udp_ip, 192, 168, 31, 121);
+    udp_dst.sin_addr.s_addr = udp_ip.addr;
+    udp_dst.sin_port = htons(6000);
+    printf("[NET] UDP report target 192.168.31.121:6000\r\n");
+  }
+  else
+  {
+    printf("[NET] UDP socket() error %d\r\n", udp_fd);
+  }
+
+  /* 事件循环：接受连接 + 处理命令 + 通过 UDP 上报传感器数据 */
   for(;;)
   {
     /* 1. 接受连接（非阻塞） */
@@ -775,19 +792,20 @@ void StartNetworkTask(void *argument)
       /* rx_len < 0：非阻塞模式下无数据，忽略 */
     }
 
-    /* 3. 从队列取传感器数据，上报给客户端 */
+    /* 3. 从队列取传感器数据，通过 UDP 上报 */
     if (osMessageQueueGet(SensorDataQueueHandle, &sensor_data, NULL, 0u) == osOK)
     {
-      if (conn_fd >= 0)
+      ftoa_1(t_str, sensor_data.temperature);
+      ftoa_1(h_str, sensor_data.humidity);
+      ftoa_1(a_str, sensor_data.air_quality);
+      tx_len = sprintf(tx_line, "T=%s H=%s A=%s TS=%lu\r\n",
+                       t_str, h_str, a_str, (unsigned long)sensor_data.timestamp);
+      if (udp_fd >= 0)
       {
-        ftoa_1(t_str, sensor_data.temperature);
-        ftoa_1(h_str, sensor_data.humidity);
-        ftoa_1(a_str, sensor_data.air_quality);
-        tx_len = sprintf(tx_line, "T=%s H=%s A=%s TS=%lu\r\n",
-                         t_str, h_str, a_str, (unsigned long)sensor_data.timestamp);
-        lwip_send(conn_fd, tx_line, tx_len, 0);
-        printf("[NET] report: %s", tx_line);
+        lwip_sendto(udp_fd, tx_line, tx_len, 0,
+                    (struct sockaddr *)&udp_dst, sizeof(udp_dst));
       }
+      printf("[NET] UDP report: %s", tx_line);
     }
 
     osDelay(10);
